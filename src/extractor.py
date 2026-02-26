@@ -1,232 +1,73 @@
 """
-extractor.py — Character segmentation and text extraction from handwritten Tamil images.
+extractor.py — Tamil handwritten text extraction from images.
+
+Supports three extraction models:
+  1. EasyOCR (PRIMARY)   — Pre-trained, works immediately, no dataset needed
+  2. Custom CNN          — Requires dataset + training
+  3. MobileNetV2         — Requires dataset + training (transfer learning)
 """
 
 import os
 import cv2
 import numpy as np
-from tensorflow.keras.models import load_model
-
-from src.preprocess import IMG_HEIGHT, IMG_WIDTH, load_label_mapping
 
 
-class TamilTextExtractor:
+# ═══════════════════════════════════════════════════════════════════════
+#  MODEL 1: EasyOCR (PRIMARY — No training required)
+# ═══════════════════════════════════════════════════════════════════════
+
+class EasyOCRExtractor:
     """
-    Extract Tamil text from handwritten images using:
-    1. Image preprocessing (binarization, noise removal)
-    2. Character segmentation (contour detection)
-    3. CNN/MobileNetV2 character classification
-    4. Text assembly
-
-    Automatically detects model input channels (1=CNN, 3=MobileNet).
+    Tamil text extraction using EasyOCR.
+    Works out of the box — no dataset download or training needed.
     """
 
-    def __init__(self, model_path='models/tamil_ocr_model_cnn.h5',
-                 mapping_path='models/label_mapping.json'):
-        """
-        Initialize the extractor with a trained model and label mapping.
-        Auto-detects if model expects grayscale (1ch) or RGB (3ch) input.
-        """
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"Model not found at '{model_path}'. "
-                "Please train the model first using: python -m src.train"
-            )
-        if not os.path.exists(mapping_path):
-            raise FileNotFoundError(
-                f"Label mapping not found at '{mapping_path}'. "
-                "Please train the model first using: python -m src.train"
-            )
+    def __init__(self):
+        """Initialize EasyOCR reader with Tamil support."""
+        import easyocr
+        import shutil
+        print("Loading EasyOCR model (first time may download ~100MB)...")
 
-        self.model = load_model(model_path)
-        self.label_mapping = load_label_mapping(mapping_path)
+        # Try multiple initialization strategies to avoid model mismatch
+        strategies = [
+            {'langs': ['ta'], 'desc': 'Tamil only'},
+            {'langs': ['ta', 'en'], 'desc': 'Tamil + English'},
+            {'langs': ['en'], 'desc': 'English fallback'},
+        ]
 
-        # Auto-detect input channels from model
-        input_shape = self.model.input_shape  # e.g. (None, 64, 64, 1) or (None, 64, 64, 3)
-        self.input_channels = input_shape[-1]
-        self.model_type = 'mobilenet' if self.input_channels == 3 else 'cnn'
+        for strategy in strategies:
+            try:
+                self.reader = easyocr.Reader(
+                    strategy['langs'],
+                    gpu=False,
+                    verbose=False
+                )
+                self.languages = strategy['langs']
+                print(f"EasyOCR ready! ({strategy['desc']})")
+                return
+            except RuntimeError as e:
+                print(f"Strategy '{strategy['desc']}' failed: {e}")
+                # Clear corrupted cache and retry
+                cache_dir = os.path.join(os.path.expanduser('~'), '.EasyOCR')
+                if os.path.exists(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    print("Cleared EasyOCR cache, retrying...")
+                    try:
+                        self.reader = easyocr.Reader(
+                            strategy['langs'],
+                            gpu=False,
+                            verbose=False
+                        )
+                        self.languages = strategy['langs']
+                        print(f"EasyOCR ready after cache clear! ({strategy['desc']})")
+                        return
+                    except Exception:
+                        continue
 
-        print(f"Loaded model from '{model_path}'")
-        print(f"Model type: {self.model_type} (input channels: {self.input_channels})")
-        print(f"Loaded {len(self.label_mapping)} character classes")
-
-    def preprocess_for_segmentation(self, image):
-        """
-        Preprocess a full handwritten image for character segmentation.
-
-        Steps:
-        1. Convert to grayscale
-        2. Apply Gaussian blur to reduce noise
-        3. Apply adaptive thresholding for binarization
-        4. Apply morphological operations to clean up
-
-        Args:
-            image: Input image (BGR or grayscale)
-
-        Returns:
-            binary: Binary image ready for contour detection
-            gray: Grayscale version of the input
-        """
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
-        # Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # Adaptive thresholding for binarization
-        binary = cv2.adaptiveThreshold(
-            blurred, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            blockSize=11, C=5
+        raise RuntimeError(
+            "Could not initialize EasyOCR. Please try: "
+            "pip install --upgrade easyocr torch torchvision"
         )
-
-        # Morphological cleaning: close small gaps
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        return binary, gray
-
-    def segment_characters(self, image):
-        """
-        Segment individual characters from a handwritten text image.
-
-        Uses contour detection and sorts bounding boxes
-        left-to-right (with basic line detection for multi-line text).
-
-        Args:
-            image: Input image (BGR or grayscale)
-
-        Returns:
-            char_images: List of cropped character images (grayscale)
-            bounding_boxes: List of (x, y, w, h) tuples
-        """
-        binary, gray = self.preprocess_for_segmentation(image)
-
-        # Find contours
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        # Filter and extract bounding boxes
-        bounding_boxes = []
-        img_area = image.shape[0] * image.shape[1]
-
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = w * h
-
-            # Filter out very small or very large contours
-            if area < img_area * 0.001:  # Too small (noise)
-                continue
-            if area > img_area * 0.5:  # Too large (entire image)
-                continue
-            if w < 5 or h < 5:  # Minimum size
-                continue
-
-            bounding_boxes.append((x, y, w, h))
-
-        # Sort bounding boxes: top-to-bottom, then left-to-right
-        # Group by lines (boxes with similar y-coordinates)
-        bounding_boxes = self._sort_bounding_boxes(bounding_boxes)
-
-        # Extract character images
-        char_images = []
-        for (x, y, w, h) in bounding_boxes:
-            char_img = gray[y:y+h, x:x+w]
-            char_images.append(char_img)
-
-        return char_images, bounding_boxes
-
-    def _sort_bounding_boxes(self, boxes):
-        """
-        Sort bounding boxes in reading order:
-        top-to-bottom by line, left-to-right within each line.
-        """
-        if not boxes:
-            return boxes
-
-        # Sort by y-coordinate first
-        boxes = sorted(boxes, key=lambda b: b[1])
-
-        # Group into lines based on y-overlap
-        lines = []
-        current_line = [boxes[0]]
-
-        for box in boxes[1:]:
-            # Check if this box is on the same line as the current line
-            prev_y = current_line[-1][1]
-            prev_h = current_line[-1][3]
-            curr_y = box[1]
-
-            # If vertical overlap > 50%, same line
-            if abs(curr_y - prev_y) < prev_h * 0.5:
-                current_line.append(box)
-            else:
-                lines.append(current_line)
-                current_line = [box]
-
-        lines.append(current_line)
-
-        # Sort each line left-to-right and flatten
-        sorted_boxes = []
-        for line in lines:
-            line_sorted = sorted(line, key=lambda b: b[0])
-            sorted_boxes.extend(line_sorted)
-
-        return sorted_boxes
-
-    def preprocess_for_prediction(self, char_img):
-        """
-        Preprocess a single character image for model prediction.
-        Handles both CNN (1-channel) and MobileNet (3-channel) models.
-
-        Args:
-            char_img: Grayscale character image (any size)
-
-        Returns:
-            processed: Preprocessed image ready for model (1, 64, 64, C)
-        """
-        # Resize to model input size
-        resized = cv2.resize(char_img, (IMG_WIDTH, IMG_HEIGHT))
-
-        # Invert if background is white (model expects white text on black bg)
-        if np.mean(resized) > 127:
-            resized = 255 - resized
-
-        # Normalize to [0, 1]
-        normalized = resized.astype(np.float32) / 255.0
-
-        if self.input_channels == 3:
-            # MobileNetV2: convert grayscale to 3-channel
-            normalized = np.stack([normalized] * 3, axis=-1)
-            processed = normalized.reshape(1, IMG_HEIGHT, IMG_WIDTH, 3)
-        else:
-            # Custom CNN: 1-channel grayscale
-            processed = normalized.reshape(1, IMG_HEIGHT, IMG_WIDTH, 1)
-
-        return processed
-
-    def predict_character(self, char_img):
-        """
-        Predict a single character.
-
-        Args:
-            char_img: Grayscale character image
-
-        Returns:
-            predicted_label: The predicted Tamil character label
-            confidence: Prediction confidence (0-1)
-        """
-        processed = self.preprocess_for_prediction(char_img)
-        predictions = self.model.predict(processed, verbose=0)
-        predicted_class = np.argmax(predictions[0])
-        confidence = float(predictions[0][predicted_class])
-        predicted_label = self.label_mapping.get(str(predicted_class), '?')
-        return predicted_label, confidence
 
     def predict_text(self, image_path, confidence_threshold=0.3):
         """
@@ -234,108 +75,195 @@ class TamilTextExtractor:
 
         Args:
             image_path: Path to the input image
-            confidence_threshold: Minimum confidence to include a character
+            confidence_threshold: Minimum confidence to include text
 
         Returns:
             text: Extracted Tamil text string
-            details: List of dicts with char info (label, confidence, bbox)
+            details: List of dicts with detection info
         """
-        # Load image
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Could not load image: '{image_path}'")
+        results = self.reader.readtext(image_path)
 
-        # Segment characters
-        char_images, bounding_boxes = self.segment_characters(image)
-
-        if not char_images:
-            return "", []
-
-        # Predict each character
         text_parts = []
         details = []
 
-        for char_img, bbox in zip(char_images, bounding_boxes):
-            label, confidence = self.predict_character(char_img)
+        for (bbox, text, confidence) in results:
+            # bbox is [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            x_coords = [int(p[0]) for p in bbox]
+            y_coords = [int(p[1]) for p in bbox]
+            x, y = min(x_coords), min(y_coords)
+            w, h = max(x_coords) - x, max(y_coords) - y
 
             detail = {
-                'label': label,
-                'confidence': confidence,
-                'bbox': bbox
+                'label': text,
+                'confidence': float(confidence),
+                'bbox': (x, y, w, h)
             }
             details.append(detail)
 
             if confidence >= confidence_threshold:
-                text_parts.append(label)
-            else:
-                text_parts.append('?')  # Low confidence placeholder
+                text_parts.append(text)
 
-        text = ''.join(text_parts)
-        return text, details
+        full_text = ' '.join(text_parts)
+        return full_text, details
 
     def visualize_segmentation(self, image_path, output_path=None):
-        """
-        Visualize character segmentation with bounding boxes on the image.
-
-        Args:
-            image_path: Path to the input image
-            output_path: Path to save the visualization (optional)
-
-        Returns:
-            annotated_image: Image with bounding boxes drawn
-        """
+        """Draw bounding boxes on detected text regions."""
         image = cv2.imread(image_path)
         if image is None:
             raise ValueError(f"Could not load image: '{image_path}'")
 
-        char_images, bounding_boxes = self.segment_characters(image)
+        _, details = self.predict_text(image_path)
 
-        annotated = image.copy()
-        for i, (x, y, w, h) in enumerate(bounding_boxes):
-            cv2.rectangle(annotated, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(annotated, str(i), (x, y-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        for d in details:
+            x, y, w, h = d['bbox']
+            color = (0, 255, 0) if d['confidence'] > 0.5 else (0, 165, 255)
+            cv2.rectangle(image, (x, y), (x+w, y+h), color, 2)
 
         if output_path:
-            cv2.imwrite(output_path, annotated)
-            print(f"Segmentation visualization saved to '{output_path}'")
+            cv2.imwrite(output_path, image)
 
-        return annotated
+        return image
 
 
-def predict_text(image_path,
-                 model_path='models/tamil_ocr_model_cnn.h5',
-                 mapping_path='models/label_mapping.json'):
+# ═══════════════════════════════════════════════════════════════════════
+#  MODEL 2 & 3: CNN / MobileNetV2 (Requires training)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CNNExtractor:
     """
-    Convenience function for quick text extraction.
-
-    Args:
-        image_path: Path to the input image
-        model_path: Path to the trained model
-        mapping_path: Path to the label mapping JSON
-
-    Returns:
-        Extracted Tamil text string
+    Tamil text extraction using trained CNN or MobileNetV2 model.
+    Requires training first via: python -m src.train
     """
-    extractor = TamilTextExtractor(model_path, mapping_path)
-    text, _ = extractor.predict_text(image_path)
-    return text
 
+    def __init__(self, model_path, mapping_path='models/label_mapping.json'):
+        """Load trained model and label mapping."""
+        from tensorflow.keras.models import load_model
+        from src.preprocess import load_label_mapping, IMG_HEIGHT, IMG_WIDTH
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Model not found at '{model_path}'. "
+                "Train first: python -m src.train"
+            )
+
+        self.model = load_model(model_path)
+        self.label_mapping = load_label_mapping(mapping_path)
+        self.img_h = IMG_HEIGHT
+        self.img_w = IMG_WIDTH
+
+        # Auto-detect input channels
+        self.input_channels = self.model.input_shape[-1]
+        self.model_type = 'MobileNetV2' if self.input_channels == 3 else 'Custom CNN'
+
+        print(f"Loaded {self.model_type} from '{model_path}'")
+        print(f"Classes: {len(self.label_mapping)}")
+
+    def predict_text(self, image_path, confidence_threshold=0.3):
+        """Extract text using character segmentation + CNN classification."""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: '{image_path}'")
+
+        char_images, bounding_boxes = self._segment_characters(image)
+        if not char_images:
+            return "", []
+
+        text_parts = []
+        details = []
+
+        for char_img, bbox in zip(char_images, bounding_boxes):
+            label, confidence = self._predict_character(char_img)
+            details.append({
+                'label': label,
+                'confidence': confidence,
+                'bbox': bbox
+            })
+            text_parts.append(label if confidence >= confidence_threshold else '?')
+
+        return ''.join(text_parts), details
+
+    def _segment_characters(self, image):
+        """Segment individual characters using contour detection."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        binary = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, blockSize=11, C=5
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        img_area = image.shape[0] * image.shape[1]
+
+        boxes = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            area = w * h
+            if area < img_area * 0.001 or area > img_area * 0.5 or w < 5 or h < 5:
+                continue
+            boxes.append((x, y, w, h))
+
+        # Sort: top-to-bottom, left-to-right
+        boxes = sorted(boxes, key=lambda b: (b[1] // 30, b[0]))
+
+        char_images = [gray[y:y+h, x:x+w] for x, y, w, h in boxes]
+        return char_images, boxes
+
+    def _predict_character(self, char_img):
+        """Classify a single character image."""
+        resized = cv2.resize(char_img, (self.img_w, self.img_h))
+        if np.mean(resized) > 127:
+            resized = 255 - resized
+        normalized = resized.astype(np.float32) / 255.0
+
+        if self.input_channels == 3:
+            processed = np.stack([normalized] * 3, axis=-1).reshape(1, self.img_h, self.img_w, 3)
+        else:
+            processed = normalized.reshape(1, self.img_h, self.img_w, 1)
+
+        preds = self.model.predict(processed, verbose=0)
+        idx = np.argmax(preds[0])
+        return self.label_mapping.get(str(idx), '?'), float(preds[0][idx])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Utility: discover available models
+# ═══════════════════════════════════════════════════════════════════════
 
 def get_available_models(model_dir='models'):
     """
-    List available trained models.
+    List all available models for the UI.
 
     Returns:
-        dict: {display_name: model_path}
+        dict: {display_name: {'type': 'easyocr'|'cnn'|'mobilenet', 'path': ...}}
     """
-    models = {}
+    models = {
+        'EasyOCR (Pre-trained)': {'type': 'easyocr', 'path': None}
+    }
+
     cnn_path = os.path.join(model_dir, 'tamil_ocr_model_cnn.h5')
     mobilenet_path = os.path.join(model_dir, 'tamil_ocr_model_mobilenet.h5')
 
     if os.path.exists(cnn_path):
-        models['Custom CNN'] = cnn_path
+        models['Custom CNN (Trained)'] = {'type': 'cnn', 'path': cnn_path}
     if os.path.exists(mobilenet_path):
-        models['MobileNetV2 (Transfer Learning)'] = mobilenet_path
+        models['MobileNetV2 (Transfer Learning)'] = {'type': 'mobilenet', 'path': mobilenet_path}
 
     return models
+
+
+def load_extractor(model_info):
+    """
+    Load the appropriate extractor based on model info.
+
+    Args:
+        model_info: dict with 'type' and 'path' keys
+
+    Returns:
+        Extractor instance (EasyOCRExtractor or CNNExtractor)
+    """
+    if model_info['type'] == 'easyocr':
+        return EasyOCRExtractor()
+    else:
+        return CNNExtractor(model_info['path'])
