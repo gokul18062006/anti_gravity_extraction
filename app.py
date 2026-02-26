@@ -10,13 +10,6 @@ Run with:
     streamlit run app.py
 """
 
-# Fix Windows encoding issue (EasyOCR uses Unicode progress bars)
-import sys
-import io
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
 import streamlit as st
 import cv2
 import numpy as np
