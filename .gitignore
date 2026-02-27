@@ -1,0 +1,38 @@
+# Virtual environment
+venv/
+env/
+.env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Models (too large for git)
+models/*.h5
+models/*.pth
+*.h5
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp files
+temp_upload.*
+test_easyocr.py
+*.tmp
+
+# EasyOCR cache
+.EasyOCR/
+
+# Data
+data/

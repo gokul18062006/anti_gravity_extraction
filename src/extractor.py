@@ -100,8 +100,34 @@ class EasyOCRExtractor:
             }
             details.append(detail)
 
-            if confidence >= confidence_threshold:
-                text_parts.append(text)
+        # Sort by reading order: group into lines by y-position, then left-to-right
+        if details:
+            # Sort by y first to find lines
+            sorted_details = sorted(details, key=lambda d: d['bbox'][1])
+            
+            # Group into lines (regions with similar y are on the same line)
+            lines = []
+            current_line = [sorted_details[0]]
+            for d in sorted_details[1:]:
+                prev_y = current_line[0]['bbox'][1]
+                prev_h = current_line[0]['bbox'][3]
+                curr_y = d['bbox'][1]
+                # If y-overlap is significant, same line
+                if abs(curr_y - prev_y) < prev_h * 0.5:
+                    current_line.append(d)
+                else:
+                    lines.append(current_line)
+                    current_line = [d]
+            lines.append(current_line)
+            
+            # Sort each line left-to-right, then rebuild details and text
+            details = []
+            for line in lines:
+                line_sorted = sorted(line, key=lambda d: d['bbox'][0])
+                for d in line_sorted:
+                    details.append(d)
+                    if d['confidence'] >= confidence_threshold:
+                        text_parts.append(d['label'])
 
         full_text = ' '.join(text_parts)
         return full_text, details

@@ -15,6 +15,11 @@ import cv2
 import numpy as np
 from PIL import Image
 import os
+import requests
+import io
+
+BACKEND_URL = "http://localhost:8000"
+
 
 # Page configuration
 st.set_page_config(
@@ -184,6 +189,22 @@ def main():
         - 🟣 **MobileNetV2** — Transfer learning
         """)
 
+        st.markdown("---")
+        st.markdown("### 🔌 Backend Mode")
+        use_api = st.checkbox("Use FastAPI Backend", value=False,
+                              help="Call FastAPI backend at localhost:8000 instead of direct extraction")
+        if use_api:
+            try:
+                r = requests.get(f"{BACKEND_URL}/api/health", timeout=2)
+                if r.status_code == 200:
+                    st.markdown('<span class="model-badge-easyocr">✅ Backend Connected</span>', unsafe_allow_html=True)
+                else:
+                    st.warning("Backend returned error")
+                    use_api = False
+            except Exception:
+                st.warning("Backend not running. Start it with:\n`python backend.py`")
+                use_api = False
+
     # ── Main Content ──────────────────────────────────────────────────
     col1, col2 = st.columns([1, 1], gap="large")
 
@@ -218,31 +239,53 @@ def main():
             if extract_btn:
                 with st.spinner(f"🔄 Extracting with {selected_model_name}..."):
                     try:
-                        from src.extractor import load_extractor
+                        text = ""
+                        details = []
 
-                        extractor = load_extractor(selected_model_info)
+                        if use_api:
+                            # ── API Mode: call FastAPI backend ──
+                            uploaded_file.seek(0)
+                            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                            params = {
+                                "model": selected_model_info['type'],
+                                "confidence_threshold": confidence_threshold
+                            }
+                            resp = requests.post(
+                                f"{BACKEND_URL}/api/extract",
+                                files=files,
+                                params=params,
+                                timeout=60
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                text = data['text']
+                                details = [
+                                    {'label': r['label'], 'confidence': r['confidence'], 'bbox': tuple(r['bbox'])}
+                                    for r in data['regions']
+                                ]
+                            else:
+                                st.error(f"API Error: {resp.json().get('error', resp.text)}")
 
-                        # Save temp image for extraction
-                        img_array = np.array(image)
-                        if len(img_array.shape) == 2:
-                            img_cv = img_array
-                        elif img_array.shape[2] == 4:
-                            img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
                         else:
-                            img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                            # ── Direct Mode: load model locally ──
+                            from src.extractor import load_extractor
+                            extractor = load_extractor(selected_model_info)
 
-                        temp_path = 'temp_upload.png'
-                        cv2.imwrite(temp_path, img_cv)
+                            img_array = np.array(image)
+                            if len(img_array.shape) == 2:
+                                img_cv = img_array
+                            elif img_array.shape[2] == 4:
+                                img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
+                            else:
+                                img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-                        # Extract text
-                        text, details = extractor.predict_text(
-                            temp_path,
-                            confidence_threshold=confidence_threshold
-                        )
-
-                        # Clean up
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
+                            temp_path = 'temp_upload.png'
+                            cv2.imwrite(temp_path, img_cv)
+                            text, details = extractor.predict_text(
+                                temp_path, confidence_threshold=confidence_threshold
+                            )
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
 
                         # Display results
                         if text:
